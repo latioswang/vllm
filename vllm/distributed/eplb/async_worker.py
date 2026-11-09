@@ -43,8 +43,8 @@ STALE_JOB_WARNING_INTERVAL_S = 60.0
 # Call sites of the EP all-reduces below. Each all-reduce counts the ranks at
 # every call site, so ranks reaching different ones fail loudly on every rank
 # instead of silently pairing with each other.
-_POLL_TAG, _READY_TAG, _DRAIN_TAG = range(3)
 _NUM_TAGS = 3
+_POLL_TAG, _READY_TAG, _DRAIN_TAG = range(_NUM_TAGS)
 
 
 class AsyncEplbExecutor:
@@ -93,6 +93,7 @@ class AsyncEplbExecutor:
             try:
                 result = job(stream)
             except BaseException as exc:
+                logger.exception("Async EPLB job failed")
                 future.set_exception(exc)
             else:
                 future.set_result(result)
@@ -118,10 +119,7 @@ class _StaleJob:
 
     future: Future
     since: float = field(default_factory=time.monotonic)
-    last_warning: float = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.last_warning = self.since
+    last_warning: float = field(default_factory=time.monotonic)
 
     def should_warn(self) -> bool:
         now = time.monotonic()
@@ -161,6 +159,16 @@ class AsyncEplbRunner:
         """Set on every rank when a job failed on any rank, until `reset()`."""
         return self._error
 
+    @property
+    def cycle_running(self) -> bool:
+        return self._cycle is not None
+
+    @property
+    def busy(self) -> bool:
+        """Whether this rank has a job still running, stale or not."""
+        stale = self._stale.future if self._stale is not None else None
+        return any(job is not None and not job.done() for job in (self._job, stale))
+
     def start(
         self,
         model_states: Sequence["EplbModelState"],
@@ -168,15 +176,20 @@ class AsyncEplbRunner:
         policy: type[AbstractEplbPolicy],
         migration_batching: bool,
     ) -> None:
-        """Start a cycle. Every EP rank must call this in the same step."""
+        """Start a cycle. Every EP rank must call this in the same step.
+
+        Raises:
+            RuntimeError: A job failed before and `reset()` was not called.
+
+        """
+        if self._error is not None:
+            raise self._error
         assert self._cycle is None, "An async EPLB cycle is already running."
-        if self._stale is not None and self._stale.future.done():
-            self._stale = None
-        assert self._stale is None, "A discarded async EPLB job is still running."
-        self._cycle = self._run_cycle(
-            list(model_states), list(stats), policy, migration_batching
+        assert not self._stale_job_running(), (
+            "A discarded async EPLB job is still running."
         )
-        self._job = next(self._cycle)
+        self._cycle = self._run_cycle(model_states, stats, policy, migration_batching)
+        self._advance(None)
 
     def poll(self) -> None:
         """Advance the cycle if every rank finished its job. Called by every EP
@@ -188,17 +201,11 @@ class AsyncEplbRunner:
         """
         if self._error is not None:
             raise self._error
-        self._collect_stale_job()
+        self._warn_about_stale_job()
         if self._cycle is None or not self._all_ranks_done():
             return
         assert self._job is not None
-        try:
-            self._job = self._cycle.send(self._job.result())
-        except StopIteration:
-            self._cycle = self._job = None
-        except BaseException:
-            self._cycle = self._job = None
-            raise
+        self._advance(self._job.result())
 
     def ready_for_new_cycle(self) -> bool:
         """Whether no rank has a cycle or a stale job. Collective.
@@ -208,9 +215,7 @@ class AsyncEplbRunner:
         """
         if self._cycle is not None:
             return False
-        if self._stale is not None and self._stale.future.done():
-            self._stale = None
-        _, num_busy = _all_reduce_flags(False, self._stale is not None, _READY_TAG)
+        _, num_busy = _all_reduce_flags(False, self._stale_job_running(), _READY_TAG)
         return num_busy == 0
 
     def reset(self) -> None:
@@ -231,22 +236,32 @@ class AsyncEplbRunner:
         keep their new placement.
 
         Raises:
-            RuntimeError: The cycle's job failed on some rank.
+            RuntimeError: A job failed on some rank, now or before `reset()`.
 
         """
+        if self._error is not None:
+            raise self._error
         draining = self._cycle is not None or self._stale is not None
         if draining:
             logger.info("Draining async EPLB")
+        start = last_warning = time.monotonic()
         while True:
             job = self._job
-            stale = self._stale.future if self._stale is not None else None
             failed = job is not None and job.done() and job.exception() is not None
-            busy = any(j is not None and not j.done() for j in (job, stale))
-            num_failed, num_busy = _all_reduce_flags(failed, busy, _DRAIN_TAG)
+            num_failed, num_busy = _all_reduce_flags(failed, self.busy, _DRAIN_TAG)
             if num_failed:
                 self._fail(num_failed)
             if num_busy == 0:
                 break
+            now = time.monotonic()
+            if now - last_warning >= STALE_JOB_WARNING_INTERVAL_S:
+                last_warning = now
+                logger.warning(
+                    "Async EPLB drain still waits for a job on %d EP rank(s) "
+                    "after %.0f s.",
+                    num_busy,
+                    now - start,
+                )
             time.sleep(0.001)
         self._stale = None
         self._drop_cycle()
@@ -255,8 +270,8 @@ class AsyncEplbRunner:
 
     def _run_cycle(
         self,
-        model_states: list["EplbModelState"],
-        stats: list["EplbStats"],
+        model_states: Sequence["EplbModelState"],
+        stats: Sequence["EplbStats"],
         policy: type[AbstractEplbPolicy],
         migration_batching: bool,
     ) -> Generator[Future, Any, None]:
@@ -297,6 +312,21 @@ class AsyncEplbRunner:
                 )
             start = time.perf_counter()
 
+    def _advance(self, result: Any) -> None:
+        """Resume the cycle with a job's result, up to its next job."""
+        assert self._cycle is not None
+        try:
+            self._job = self._cycle.send(result)
+        except StopIteration:
+            self._cycle = self._job = None
+        except BaseException as exc:
+            # Submitting or applying failed on this rank only. Keep the cycle
+            # with a failed job, so that the next collective raises on every
+            # rank instead of leaving the other ranks waiting for this one.
+            self._job = Future()
+            self._job.set_exception(exc)
+            raise
+
     def _submit(self, job: Callable[..., Any], **kwargs: Any) -> Future:
         """Submit a job that may read anything the main stream wrote so far."""
         ready_event = torch.Event()
@@ -320,7 +350,7 @@ class AsyncEplbRunner:
         """Store and raise the error after a job failed on some rank."""
         error = self._job.exception() if self._job and self._job.done() else None
         failure = RuntimeError(
-            f"Async EPLB job failed on {num_failed} rank(s); see the worker logs."
+            f"Async EPLB failed on {num_failed} rank(s); see the logs of those ranks."
         )
         failure.__cause__ = error
         self._error = failure
@@ -335,14 +365,16 @@ class AsyncEplbRunner:
             self._stale = _StaleJob(self._job)
         self._cycle = self._job = None
 
-    def _collect_stale_job(self) -> None:
-        """Forget a finished stale job, or warn now and then that it lingers."""
-        stale = self._stale
-        if stale is None:
-            return
-        if stale.future.done():
+    def _stale_job_running(self) -> bool:
+        """Whether a stale job still runs. Forgets it once it finished."""
+        if self._stale is not None and self._stale.future.done():
             self._stale = None
-        elif stale.should_warn():
+        return self._stale is not None
+
+    def _warn_about_stale_job(self) -> None:
+        """Warn now and then that a stale job lingers."""
+        stale = self._stale
+        if self._stale_job_running() and stale is not None and stale.should_warn():
             logger.warning(
                 "Discarded async EPLB job on EP rank %d is still running after "
                 "%.0f s; no rebalance starts until it finishes. Serving "

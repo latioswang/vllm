@@ -646,12 +646,20 @@ class EplbState:
             self.async_runner.poll()
 
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
-            if self.is_async and not self._get_async_runner().ready_for_new_cycle():
-                # Still performing or discarding an asynchronous rearrangement;
-                # update should_record (step > step_interval, so always True)
-                # and bail out before the step counter is reset.
-                self._update_layer_should_record(log_stats=log_stats)
-                return
+            if self.is_async:
+                runner = self._get_async_runner()
+                if runner.cycle_running:
+                    # Still performing an asynchronous rearrangement; update
+                    # should_record (step > step_interval, so always True) and
+                    # bail out before the step counter is reset.
+                    self._update_layer_should_record(log_stats=log_stats)
+                    return
+                if not runner.ready_for_new_cycle():
+                    # A discarded job still runs on some rank. Check again
+                    # after another interval instead of on every step.
+                    self.expert_rearrangement_step = 0
+                    self._update_layer_should_record(log_stats=log_stats)
+                    return
             self.expert_rearrangement_step = 0
             self.rearrange()
 

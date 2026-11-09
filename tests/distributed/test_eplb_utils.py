@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm.distributed.eplb import async_worker
+from vllm.distributed.eplb import async_worker, eplb_state
 from vllm.distributed.eplb.async_worker import AsyncEplbExecutor
 from vllm.distributed.eplb.eplb_state import (
     _commit_eplb_maps,
@@ -251,10 +251,50 @@ def test_async_eplb_failure_raises_until_reset(async_eplb):
         run.state.step()
     assert again.value is exc_info.value
     assert run.transfers == [(0, 0)]
+    # Elastic EP must not start or drain a cycle on a failed runner either.
+    with pytest.raises(RuntimeError) as on_start:
+        run.state.async_runner.start(run.model_states, [], run.policy, False)
+    assert on_start.value is exc_info.value
+    with pytest.raises(RuntimeError) as on_drain:
+        run.state.drain_async()
+    assert on_drain.value is exc_info.value
 
     reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
     assert run.state.async_runner.error is None
     assert not async_cycle_running(run.state)
+    start_async_rearrangement(run.state)
+    finish_async_cycle(run.state)
+    assert run.transfers[-4:] == [(m, layer) for m in range(2) for layer in range(2)]
+
+
+@pytest.mark.parametrize("failing_step", ["submit", "apply"])
+def test_async_eplb_main_thread_failure_reaches_every_rank(
+    async_eplb, monkeypatch, failing_step
+):
+    """A failure outside the worker thread raises at once on this rank, and
+    the next step reports it through the all-reduce like a failed job, so the
+    other ranks do not wait for this one."""
+    run = async_eplb
+    error = RuntimeError("injected main-thread failure")
+
+    def fail(*args, **kwargs):
+        raise error
+
+    with monkeypatch.context() as patch:
+        if failing_step == "submit":
+            patch.setattr(AsyncEplbExecutor, "submit", fail)
+        else:
+            patch.setattr(eplb_state, "move_from_buffer", fail)
+        with pytest.raises(RuntimeError) as exc_info:
+            start_async_rearrangement(run.state)
+            finish_async_cycle(run.state)
+    assert exc_info.value is error
+
+    with pytest.raises(RuntimeError, match="Async EPLB failed") as collective:
+        run.state.step()
+    assert collective.value.__cause__ is error
+
+    reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
     start_async_rearrangement(run.state)
     finish_async_cycle(run.state)
     assert run.transfers[-4:] == [(m, layer) for m in range(2) for layer in range(2)]
@@ -269,17 +309,18 @@ def test_reset_leaves_in_flight_job_stale(async_eplb, monkeypatch):
     start_async_rearrangement(run.state)
     wait_for_async_jobs(run.state)
     run.state.step()  # Applies the plan and submits the gated transfer.
-    stale_job = run.state.async_runner._job
 
     reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
     assert not async_cycle_running(run.state)
-    assert run.state.async_runner._stale.future is stale_job
+    assert run.state.async_runner.busy
 
     warn = MagicMock()
     monkeypatch.setattr(async_worker, "STALE_JOB_WARNING_INTERVAL_S", 0)
     monkeypatch.setattr(async_worker.logger, "warning", warn)
     plans_before = run.policy.calls
     start_async_rearrangement(run.state)
+    # The next check comes after another interval, not on every step.
+    assert run.state.expert_rearrangement_step == 0
     run.state.step()
     assert not async_cycle_running(run.state)
     assert run.policy.calls == plans_before
@@ -288,8 +329,7 @@ def test_reset_leaves_in_flight_job_stale(async_eplb, monkeypatch):
     del run.gates[(0, 0)]
     gate.set()
     wait_for_async_jobs(run.state)
-    run.state.step()
-    assert run.state.async_runner._stale is None
+    start_async_rearrangement(run.state)
     assert async_cycle_running(run.state)
     finish_async_cycle(run.state)
 
@@ -313,7 +353,7 @@ def test_drain_discards_in_flight_layer(async_eplb):
     assert run.applied == []
 
 
-def test_drain_waits_for_stale_job(async_eplb):
+def test_drain_waits_for_stale_job(async_eplb, monkeypatch):
     """Elastic EP rearranges right after a drain, so the drain must also wait
     for a discarded transfer that may still write the expert buffer."""
     run = async_eplb
@@ -327,12 +367,16 @@ def test_drain_waits_for_stale_job(async_eplb):
     with pytest.raises(AssertionError, match="still running"):
         runner.start(run.model_states, [], run.policy, False)
 
+    warn = MagicMock()
+    monkeypatch.setattr(async_worker, "STALE_JOB_WARNING_INTERVAL_S", 0)
+    monkeypatch.setattr(async_worker.logger, "warning", warn)
     drain = threading.Thread(target=run.state.drain_async)
     drain.start()
     drain.join(0.5)
     assert drain.is_alive()
+    assert "drain still waits" in warn.call_args.args[0]
     gate.set()
     drain.join(ASYNC_JOB_TIMEOUT_S)
     assert not drain.is_alive()
-    assert runner._stale is None
+    assert not runner.busy
     assert run.applied == []

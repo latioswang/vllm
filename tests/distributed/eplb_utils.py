@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import atexit
-import concurrent.futures
 import os
 import random
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -204,17 +204,15 @@ def start_async_rearrangement(state) -> None:
 
 
 def async_cycle_running(state) -> bool:
-    return state.async_runner._cycle is not None
+    return state.async_runner.cycle_running
 
 
 def wait_for_async_jobs(state) -> None:
     """Wait until this rank's in-flight async EPLB job, if any, finishes."""
-    runner = state.async_runner
-    stale = runner._stale.future if runner._stale is not None else None
-    for job in (runner._job, stale):
-        if job is not None:
-            done, _ = concurrent.futures.wait([job], ASYNC_JOB_TIMEOUT_S)
-            assert done, "async EPLB job hung"
+    deadline = time.monotonic() + ASYNC_JOB_TIMEOUT_S
+    while state.async_runner.busy:
+        assert time.monotonic() < deadline, "async EPLB job hung"
+        time.sleep(0.001)
 
 
 def finish_async_cycle(state) -> None:

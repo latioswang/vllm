@@ -985,10 +985,9 @@ def _test_async_eplb_rank_failure_worker(env, world_size: int) -> None:
         if rank == 1:
             wait_for_async_jobs(state)
         reset_eplb_async_state(SimpleNamespace(eplb_state=state))
-        assert (state.async_runner._stale is not None) == (rank == 0)
+        assert state.async_runner.busy == (rank == 0)
         plans = run.policy.calls
         start_async_rearrangement(state)
-        state.step()
         assert not async_cycle_running(state)
         assert run.policy.calls == plans
 
@@ -996,7 +995,7 @@ def _test_async_eplb_rank_failure_worker(env, world_size: int) -> None:
             gate.set()
         while not async_cycle_running(state):
             wait_for_async_jobs(state)
-            state.step()
+            start_async_rearrangement(state)
         finish_async_cycle(state)
         # Layer 0 from the failed cycle, then the full last cycle.
         assert [meta[1] for meta in run.applied] == [(0, 0), (0, 0), (0, 1)]
