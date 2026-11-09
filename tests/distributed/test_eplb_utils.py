@@ -1,14 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+from vllm.distributed.eplb import async_worker
+from vllm.distributed.eplb.async_worker import AsyncEplbExecutor
 from vllm.distributed.eplb.eplb_state import (
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
+)
+from vllm.platforms import current_platform
+from vllm.v1.worker.sentinel.eplb_redistribute import reset_eplb_async_state
+
+from .eplb_utils import (
+    ASYNC_JOB_TIMEOUT_S,
+    async_cycle_running,
+    finish_async_cycle,
+    make_async_eplb_state,
+    start_async_rearrangement,
+    wait_for_async_jobs,
 )
 
 
@@ -182,3 +197,117 @@ def test_commit_eplb_maps_for_layer_does_not_sync_host():
         _commit_eplb_maps_for_layer(model_state, new_phy2log, layer=0)
     finally:
         torch.cuda.set_sync_debug_mode(prev_mode)
+
+
+@pytest.fixture
+def async_eplb(dist_init, monkeypatch):
+    return make_async_eplb_state(
+        monkeypatch, torch.device(current_platform.device_type), num_models=2
+    )
+
+
+def test_async_executor_runs_jobs_on_a_daemon_thread():
+    """The worker thread must not block interpreter exit when a job hangs."""
+    if not torch.accelerator.is_available():
+        pytest.skip("Async EPLB needs an accelerator")
+    executor = AsyncEplbExecutor(torch.accelerator.current_device_index())
+    assert executor.thread.daemon
+
+    stream = executor.submit(lambda stream: stream).result(ASYNC_JOB_TIMEOUT_S)
+    assert isinstance(stream, torch.Stream)
+
+    error = RuntimeError("job failed")
+
+    def failing_job(stream):
+        raise error
+
+    assert executor.submit(failing_job).exception(ASYNC_JOB_TIMEOUT_S) is error
+
+
+def test_async_eplb_applies_every_layer_of_every_model_in_order(async_eplb):
+    run = async_eplb
+    start_async_rearrangement(run.state)
+    finish_async_cycle(run.state)
+
+    expected = [(m, layer) for m in range(2) for layer in range(2)]
+    assert run.transfers == expected
+    assert [meta[1] for meta in run.applied] == expected
+    for model_state in run.model_states:
+        expected_map = torch.arange(4).roll(1).repeat(2, 1)
+        assert torch.equal(model_state.physical_to_logical_map.cpu(), expected_map)
+
+
+def test_async_eplb_failure_raises_until_reset(async_eplb):
+    """A failed job reaches step() so fault tolerance can react. No new job is
+    scheduled until the reset, after which EPLB resumes."""
+    run = async_eplb
+    run.fail.add((0, 1))
+    start_async_rearrangement(run.state)
+    with pytest.raises(RuntimeError) as exc_info:
+        finish_async_cycle(run.state)
+    assert "injected transfer failure" in str(exc_info.value.__cause__)
+
+    with pytest.raises(RuntimeError) as again:
+        run.state.step()
+    assert again.value is exc_info.value
+    assert run.transfers == [(0, 0)]
+
+    reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
+    assert run.state.async_runner.error is None
+    assert not async_cycle_running(run.state)
+    start_async_rearrangement(run.state)
+    finish_async_cycle(run.state)
+    assert run.transfers[-4:] == [(m, layer) for m in range(2) for layer in range(2)]
+
+
+def test_reset_leaves_in_flight_job_stale(async_eplb, monkeypatch):
+    """Fault recovery does not wait for a running job. Its result is never
+    applied, and no new cycle starts until it finishes."""
+    run = async_eplb
+    gate = threading.Event()
+    run.gates[(0, 0)] = gate
+    start_async_rearrangement(run.state)
+    wait_for_async_jobs(run.state)
+    run.state.step()  # Applies the plan and submits the gated transfer.
+    stale_job = run.state.async_runner._job
+
+    reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
+    assert not async_cycle_running(run.state)
+    assert run.state.async_runner._stale.future is stale_job
+
+    warn = MagicMock()
+    monkeypatch.setattr(async_worker, "STALE_JOB_WARNING_INTERVAL_S", 0)
+    monkeypatch.setattr(async_worker.logger, "warning", warn)
+    plans_before = run.policy.calls
+    start_async_rearrangement(run.state)
+    run.state.step()
+    assert not async_cycle_running(run.state)
+    assert run.policy.calls == plans_before
+    assert warn.call_count == 2
+
+    del run.gates[(0, 0)]
+    gate.set()
+    wait_for_async_jobs(run.state)
+    run.state.step()
+    assert run.state.async_runner._stale is None
+    assert async_cycle_running(run.state)
+    finish_async_cycle(run.state)
+
+    stale_transfer = 1
+    assert run.applied[0][2] != stale_transfer
+    assert [meta[1] for meta in run.applied] == [
+        (m, layer) for m in range(2) for layer in range(2)
+    ]
+
+
+def test_drain_discards_in_flight_layer(async_eplb):
+    run = async_eplb
+    start_async_rearrangement(run.state)
+    wait_for_async_jobs(run.state)
+    run.state.step()  # Submits the first layer transfer.
+    wait_for_async_jobs(run.state)
+
+    run.state.drain_async()
+    assert not async_cycle_running(run.state)
+    assert run.transfers == [(0, 0)]
+    assert run.applied == []
