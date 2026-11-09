@@ -984,8 +984,9 @@ class EplbState:
         return self.async_runner
 
     def drain_async(self) -> None:
-        """Wait in lockstep for the in-flight async EPLB job and end the cycle
-        without applying it. A full rearrangement is expected to follow.
+        """Wait in lockstep until no rank has an async EPLB job in flight, then
+        end the cycle without applying it. A full rearrangement is expected to
+        follow.
         """
         if self.async_runner is not None:
             self.async_runner.drain()

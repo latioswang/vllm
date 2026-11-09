@@ -311,3 +311,28 @@ def test_drain_discards_in_flight_layer(async_eplb):
     assert not async_cycle_running(run.state)
     assert run.transfers == [(0, 0)]
     assert run.applied == []
+
+
+def test_drain_waits_for_stale_job(async_eplb):
+    """Elastic EP rearranges right after a drain, so the drain must also wait
+    for a discarded transfer that may still write the expert buffer."""
+    run = async_eplb
+    gate = threading.Event()
+    run.gates[(0, 0)] = gate
+    start_async_rearrangement(run.state)
+    wait_for_async_jobs(run.state)
+    run.state.step()  # Submits the gated transfer.
+    reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
+    runner = run.state.async_runner
+    with pytest.raises(AssertionError, match="still running"):
+        runner.start(run.model_states, [], run.policy, False)
+
+    drain = threading.Thread(target=run.state.drain_async)
+    drain.start()
+    drain.join(0.5)
+    assert drain.is_alive()
+    gate.set()
+    drain.join(ASYNC_JOB_TIMEOUT_S)
+    assert not drain.is_alive()
+    assert runner._stale is None
+    assert run.applied == []

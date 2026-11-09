@@ -40,6 +40,10 @@ ApplyLayerFn = Callable[["EplbModelState", int, torch.Tensor, TransferMetadata],
 
 STALE_JOB_WARNING_INTERVAL_S = 60.0
 
+# Distinct tags for the EP all-reduces below, so that ranks reaching different
+# call sites fail loudly instead of silently pairing with each other.
+_POLL_TAG, _READY_TAG, _DRAIN_TAG = 1, 2, 3
+
 
 class AsyncEplbExecutor:
     """Runs async EPLB jobs one at a time on a daemon thread.
@@ -164,6 +168,9 @@ class AsyncEplbRunner:
     ) -> None:
         """Start a cycle. Every EP rank must call this in the same step."""
         assert self._cycle is None, "An async EPLB cycle is already running."
+        if self._stale is not None and self._stale.future.done():
+            self._stale = None
+        assert self._stale is None, "A discarded async EPLB job is still running."
         self._cycle = self._run_cycle(
             list(model_states), list(stats), policy, migration_batching
         )
@@ -201,7 +208,7 @@ class AsyncEplbRunner:
             return False
         if self._stale is not None and self._stale.future.done():
             self._stale = None
-        _, num_busy = _all_reduce_flags(failed=False, busy=self._stale is not None)
+        _, num_busy = _all_reduce_flags(False, self._stale is not None, _READY_TAG)
         return num_busy == 0
 
     def reset(self) -> None:
@@ -215,18 +222,34 @@ class AsyncEplbRunner:
         self._drop_cycle()
 
     def drain(self) -> None:
-        """Wait in lockstep for the in-flight job, then drop the cycle.
+        """Wait until no rank has a job in flight, stale or not, then drop the
+        cycle. Collective.
 
-        The job's result is discarded. Layers applied earlier in the cycle keep
-        their new placement. No-op without a cycle.
+        The in-flight result is discarded. Layers applied earlier in the cycle
+        keep their new placement.
+
+        Raises:
+            RuntimeError: The cycle's job failed on some rank.
+
         """
-        if self._cycle is None:
-            return
-        logger.info("Draining async EPLB")
-        while not self._all_ranks_done():
+        draining = self._cycle is not None or self._stale is not None
+        if draining:
+            logger.info("Draining async EPLB")
+        while True:
+            job = self._job
+            stale = self._stale.future if self._stale is not None else None
+            failed = job is not None and job.done() and job.exception() is not None
+            busy = any(j is not None and not j.done() for j in (job, stale))
+            num_failed, num_busy = _all_reduce_flags(failed, busy, _DRAIN_TAG)
+            if num_failed:
+                self._fail(num_failed)
+            if num_busy == 0:
+                break
             time.sleep(0.001)
+        self._stale = None
         self._drop_cycle()
-        logger.info("Async EPLB drained")
+        if draining:
+            logger.info("Async EPLB drained")
 
     def _run_cycle(
         self,
@@ -286,16 +309,21 @@ class AsyncEplbRunner:
         assert self._job is not None
         done = self._job.done()
         error = self._job.exception() if done else None
-        num_failed, num_busy = _all_reduce_flags(error is not None, not done)
+        num_failed, num_busy = _all_reduce_flags(error is not None, not done, _POLL_TAG)
         if num_failed:
-            failure = RuntimeError(
-                f"Async EPLB job failed on {num_failed} rank(s); see the worker logs."
-            )
-            failure.__cause__ = error
-            self._error = failure
-            self._drop_cycle()
-            raise failure
+            self._fail(num_failed)
         return num_busy == 0
+
+    def _fail(self, num_failed: int) -> None:
+        """Store and raise the error after a job failed on some rank."""
+        error = self._job.exception() if self._job and self._job.done() else None
+        failure = RuntimeError(
+            f"Async EPLB job failed on {num_failed} rank(s); see the worker logs."
+        )
+        failure.__cause__ = error
+        self._error = failure
+        self._drop_cycle()
+        raise failure
 
     def _drop_cycle(self) -> None:
         if self._cycle is not None:
@@ -322,12 +350,23 @@ class AsyncEplbRunner:
             )
 
 
-def _all_reduce_flags(failed: bool, busy: bool) -> tuple[int, int]:
-    """Count the EP ranks whose async EPLB job failed or is still running."""
-    flags = torch.tensor((int(failed), int(busy)), dtype=torch.int32, device="cpu")
+def _all_reduce_flags(failed: bool, busy: bool, tag: int) -> tuple[int, int]:
+    """Count the EP ranks whose async EPLB job failed or is still running.
+
+    Raises:
+        RuntimeError: Ranks called this from different call sites.
+
+    """
+    ep_group = get_ep_group()
+    flags = torch.tensor((int(failed), int(busy), tag), dtype=torch.int32)
     # cpu_all_reduce_ only sums, so count failed and busy ranks.
-    get_ep_group().cpu_all_reduce_(flags)
-    num_failed, num_busy = flags.tolist()
+    ep_group.cpu_all_reduce_(flags)
+    num_failed, num_busy, tag_sum = flags.tolist()
+    if tag_sum != tag * ep_group.world_size:
+        raise RuntimeError(
+            f"Async EPLB all-reduce mismatch: this rank used tag {tag}, but the "
+            f"tags summed to {tag_sum} over {ep_group.world_size} ranks."
+        )
     return num_failed, num_busy
 
 
