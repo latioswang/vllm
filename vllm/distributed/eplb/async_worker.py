@@ -40,9 +40,11 @@ ApplyLayerFn = Callable[["EplbModelState", int, torch.Tensor, TransferMetadata],
 
 STALE_JOB_WARNING_INTERVAL_S = 60.0
 
-# Distinct tags for the EP all-reduces below, so that ranks reaching different
-# call sites fail loudly instead of silently pairing with each other.
-_POLL_TAG, _READY_TAG, _DRAIN_TAG = 1, 2, 3
+# Call sites of the EP all-reduces below. Each all-reduce counts the ranks at
+# every call site, so ranks reaching different ones fail loudly on every rank
+# instead of silently pairing with each other.
+_POLL_TAG, _READY_TAG, _DRAIN_TAG = range(3)
+_NUM_TAGS = 3
 
 
 class AsyncEplbExecutor:
@@ -358,14 +360,15 @@ def _all_reduce_flags(failed: bool, busy: bool, tag: int) -> tuple[int, int]:
 
     """
     ep_group = get_ep_group()
-    flags = torch.tensor((int(failed), int(busy), tag), dtype=torch.int32)
+    flags = torch.zeros(2 + _NUM_TAGS, dtype=torch.int32)
+    flags[0], flags[1], flags[2 + tag] = int(failed), int(busy), 1
     # cpu_all_reduce_ only sums, so count failed and busy ranks.
     ep_group.cpu_all_reduce_(flags)
-    num_failed, num_busy, tag_sum = flags.tolist()
-    if tag_sum != tag * ep_group.world_size:
+    num_failed, num_busy, *ranks_per_tag = flags.tolist()
+    if ranks_per_tag[tag] != ep_group.world_size:
         raise RuntimeError(
             f"Async EPLB all-reduce mismatch: this rank used tag {tag}, but the "
-            f"tags summed to {tag_sum} over {ep_group.world_size} ranks."
+            f"ranks per tag were {ranks_per_tag}."
         )
     return num_failed, num_busy
 

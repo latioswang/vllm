@@ -1004,7 +1004,7 @@ def _test_async_eplb_rank_failure_worker(env, world_size: int) -> None:
         # Ranks that reach different async EPLB all-reduces fail loudly
         # instead of pairing with each other.
         with pytest.raises(RuntimeError, match="all-reduce mismatch"):
-            async_worker._all_reduce_flags(False, False, tag=1 + rank)
+            async_worker._all_reduce_flags(False, False, tag=rank)
 
 
 @pytest.mark.parametrize("world_size", [2])
