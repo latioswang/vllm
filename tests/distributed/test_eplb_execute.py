@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -26,8 +27,17 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.platforms import current_platform
+from vllm.v1.worker.sentinel.eplb_redistribute import reset_eplb_async_state
 
-from .eplb_utils import distributed_run, set_env_vars_and_device
+from .eplb_utils import (
+    async_cycle_running,
+    distributed_run,
+    finish_async_cycle,
+    make_async_eplb_state,
+    set_env_vars_and_device,
+    start_async_rearrangement,
+    wait_for_async_jobs,
+)
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e8m0fnu, torch.float4_e2m1fn_x2])
@@ -936,3 +946,69 @@ def test_eplb_communicator_pipeline_parallel(world_size, backend):
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"Need at least {world_size} GPUs to run the test")
     distributed_run(_test_eplb_communicator_pipeline_parallel, world_size, backend)
+
+
+def _test_async_eplb_rank_failure_worker(env, world_size: int) -> None:
+    set_env_vars_and_device(env)
+    vllm_config = VllmConfig()
+    vllm_config.parallel_config.tensor_parallel_size = world_size
+    with (
+        set_current_vllm_config(vllm_config),
+        pytest.MonkeyPatch.context() as monkeypatch,
+    ):
+        ensure_model_parallel_initialized(
+            tensor_model_parallel_size=world_size, pipeline_model_parallel_size=1
+        )
+        rank = torch.distributed.get_rank()
+        run = make_async_eplb_state(
+            monkeypatch, torch.device(current_platform.device_type, rank)
+        )
+        state = run.state
+
+        # A failure on rank 1 raises on every rank in the same step.
+        if rank == 1:
+            run.fail.add((0, 1))
+        start_async_rearrangement(state)
+        with pytest.raises(
+            RuntimeError, match="failed on at least one rank"
+        ) as exc_info:
+            finish_async_cycle(state)
+        assert (exc_info.value.__cause__ is not None) == (rank == 1)
+        reset_eplb_async_state(SimpleNamespace(eplb_state=state))
+
+        # Reset again while rank 0's transfer still runs. No rank may start
+        # the next cycle until that stale transfer finishes.
+        if rank == 0:
+            run.gates[(0, 0)] = gate = threading.Event()
+        start_async_rearrangement(state)
+        if rank == 1:
+            wait_for_async_jobs(state)
+        reset_eplb_async_state(SimpleNamespace(eplb_state=state))
+        assert state.async_runner.busy == (rank == 0)
+        start_async_rearrangement(state)
+        assert not async_cycle_running(state)
+
+        if rank == 0:
+            gate.set()
+        while not async_cycle_running(state):
+            wait_for_async_jobs(state)
+            start_async_rearrangement(state)
+        finish_async_cycle(state)
+        # Layer 0 from the failed cycle, then the full last cycle.
+        assert [meta[1] for meta in run.applied] == [(0, 0), (0, 0), (0, 1)]
+
+        # Draining finishes a running cycle on every rank.
+        start_async_rearrangement(state)
+        state.drain_async()
+        assert not async_cycle_running(state)
+        assert [meta[1] for meta in run.applied[3:]] == [(0, 0), (0, 1)]
+
+
+@pytest.mark.parametrize("world_size", [2])
+def test_async_eplb_failure_on_one_rank_raises_on_every_rank(world_size):
+    """A job that fails on one rank stops async EPLB on every rank in the same
+    step, and a job discarded on one rank holds back the next cycle on all
+    ranks until it finishes."""
+    if torch.accelerator.device_count() < world_size:
+        pytest.skip(f"Need at least {world_size} GPUs to run the test")
+    distributed_run(_test_async_eplb_rank_failure_worker, world_size)
