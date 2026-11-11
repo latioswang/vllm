@@ -980,11 +980,12 @@ def _test_async_eplb_rank_failure_worker(env, world_size: int) -> None:
         # Layer 0 from the failed cycle, then the full last cycle.
         assert [meta[1] for meta in run.applied] == [(0, 0), (0, 0), (0, 1)]
 
-        # Draining finishes a running cycle on every rank.
+        # Draining ends a running cycle on every rank without applying it.
         start_async_rearrangement(state)
         state.drain_async()
         assert not async_cycle_running(state)
-        assert [meta[1] for meta in run.applied[3:]] == [(0, 0), (0, 1)]
+        assert len(run.applied) == 3
+        assert run.transfers[-2:] == [(0, 0), (0, 1)]
 
 
 @pytest.mark.parametrize("world_size", [2])

@@ -14,6 +14,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -52,7 +53,8 @@ class AsyncEplbExecutor:
     `ThreadPoolExecutor` threads are joined at exit.
     """
 
-    def __init__(self, device_index: int) -> None:
+    def __init__(self, device_index: int, rank: int) -> None:
+        self._rank = rank
         self._jobs: queue.SimpleQueue[
             tuple[Future, AsyncEplbJob, torch.Event | None]
         ] = queue.SimpleQueue()
@@ -80,7 +82,7 @@ class AsyncEplbExecutor:
                     after.synchronize()
                 future.set_result(job(stream))
             except BaseException as exc:
-                logger.exception("Async EPLB job failed")
+                logger.exception("Async EPLB job failed (Rank %d)", self._rank)
                 future.set_exception(exc)
 
 
@@ -108,15 +110,15 @@ class AsyncEplbRunner:
         policy: type[AbstractEplbPolicy],
         migration_batching: bool,
     ) -> None:
-        self._executor = AsyncEplbExecutor(device_index)
+        self._executor = AsyncEplbExecutor(device_index, get_ep_group().rank_in_group)
         self._apply_layer = apply_layer
         self._policy = policy
         self._migration_batching = migration_batching
         # Layers of the running cycle that are not applied yet. The job of
         # the first one is running or finished.
         self._layers_left: deque[tuple[EplbModelState, int]] = deque()
-        # The last submitted job. After a reset or a failure its result is
-        # never applied, and the next job queues behind it on the worker.
+        # The last submitted job, kept until its cycle ends. After a reset or
+        # a failure its result is never applied.
         self._job: Future | None = None
         self._error: BaseException | None = None
         self._start_time = 0.0
@@ -143,17 +145,59 @@ class AsyncEplbRunner:
         """
         if self._error is not None:
             raise self._error
-        if not self._layers_left or not self._all_ranks_done():
-            return
+        if self._layers_left and self._all_ranks_done():
+            self._finish_layer(apply=True)
+
+    def reset(self, timeout: float | None) -> None:
+        """Clear the error and drop the cycle, for fault recovery.
+
+        Not collective, so it is safe while the EP groups are broken. Every
+        rank must call it between the same two steps. Waits for a running job,
+        because the caller must not rebuild the groups under it; a job blocked
+        on a peer ends within the cpu group timeout.
+        """
+        self._layers_left.clear()
+        if self._job is not None:
+            try:
+                self._job.exception(timeout)
+            except FutureTimeoutError:
+                raise RuntimeError(
+                    f"Async EPLB worker still in a transfer job after {timeout}s."
+                ) from None
+        self._job = None
+        self._error = None
+
+    def drain(self) -> None:
+        """Run the cycle's remaining transfers in lockstep and apply none of
+        them; a full rearrange is expected to follow.
+        """
+        if self._error is not None:
+            raise self._error
+        while self._layers_left:
+            model_state = self._layers_left[0][0]
+            logger.info(
+                "Draining async EPLB worker for model %s", model_state.model_name
+            )
+            while self._layers_left and self._layers_left[0][0] is model_state:
+                if self._all_ranks_done():
+                    self._finish_layer(apply=False)
+                else:
+                    time.sleep(0.001)
+            logger.info(
+                "Async EPLB worker drained for model %s", model_state.model_name
+            )
+
+    def _finish_layer(self, apply: bool) -> None:
         assert self._job is not None
         result: AsyncEplbLayerResult = self._job.result()
         model_state, layer_idx = self._layers_left.popleft()
-        self._apply_layer(
-            model_state,
-            layer_idx,
-            result.new_physical_to_logical_map,
-            result.transfer_metadata,
-        )
+        if apply:
+            self._apply_layer(
+                model_state,
+                layer_idx,
+                result.new_physical_to_logical_map,
+                result.transfer_metadata,
+            )
         num_layers = model_state.model.num_moe_layers
         if layer_idx == num_layers - 1 and get_ep_group().rank_in_group == 0:
             logger.info(
@@ -165,28 +209,9 @@ class AsyncEplbRunner:
             )
         if self._layers_left:
             self._submit_next(result.plan)
-
-    def reset(self) -> None:
-        """Clear the error and drop the cycle, for fault recovery.
-
-        Not collective, so it is safe while the EP groups are broken. Every
-        rank must call it between the same two steps.
-        """
-        self._error = None
-        self._layers_left.clear()
-
-    def drain(self) -> None:
-        """Run the cycle to its end in lockstep."""
-        draining = self.cycle_running
-        if draining:
-            logger.info("Draining async EPLB worker")
-        while True:
-            self.poll()
-            if not self.cycle_running:
-                break
-            time.sleep(0.001)
-        if draining:
-            logger.info("Async EPLB worker drained")
+        else:
+            # Do not keep the plan alive between cycles.
+            self._job = None
 
     def _submit_next(self, plan: AsyncEplbPlan | None) -> None:
         model_state, layer_idx = self._layers_left[0]
@@ -213,6 +238,7 @@ class AsyncEplbRunner:
                 expert_buffer=model_state.expert_buffer,
                 communicator=model_state.communicator,
                 ep_group=get_eplb_group().device_group,
+                ep_cpu_group=get_eplb_group().cpu_group,
             ),
             after=main_stream_done,
         )
@@ -273,6 +299,7 @@ def transfer_layer_to_buffer(
     expert_buffer: Sequence[torch.Tensor],
     communicator: EplbCommunicator,
     ep_group: ProcessGroup,
+    ep_cpu_group: ProcessGroup,
 ) -> AsyncEplbLayerResult:
     """Fetch the new experts of one layer into `expert_buffer`.
 
@@ -309,6 +336,9 @@ def transfer_layer_to_buffer(
             new_physical_to_logical_map,
             migration_batches_by_layer,
         )
+
+    # No rank starts a transfer before every rank's worker is ready for it.
+    torch.distributed.barrier(group=ep_cpu_group)
 
     migration_batches_by_layer = plan.migration_batches_by_layer
     transfer_metadata = transfer_layer(

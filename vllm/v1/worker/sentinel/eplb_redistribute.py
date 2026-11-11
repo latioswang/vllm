@@ -272,7 +272,9 @@ def reset_eplb_async_state(model_runner: GPUModelRunner) -> None:
 
     if eplb_state.async_runner is not None:
         # An in-flight layer result is discarded, not applied.
-        eplb_state.async_runner.reset()
+        eplb_state.async_runner.reset(
+            eplb_state.parallel_config.cpu_distributed_timeout_seconds
+        )
     for ms in eplb_state.model_states.values():
         ms.expert_load_pass.zero_()
         ms.expert_load_window.zero_()

@@ -996,7 +996,10 @@ class EplbState:
         return self.async_runner
 
     def drain_async(self) -> None:
-        """Block until the in-flight async EPLB cycle has run to its end.
+        """Drain in-flight async EPLB by running all remaining layer transfers.
+
+        The transferred weights are intentionally NOT applied — a full
+        rearrange is expected to follow.
 
         Ranks are kept in lockstep by an all_reduce on the EP CPU group.
 
