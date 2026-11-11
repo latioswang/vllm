@@ -1,14 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+from vllm.distributed.eplb.async_worker import AsyncEplbExecutor
 from vllm.distributed.eplb.eplb_state import (
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
+)
+from vllm.platforms import current_platform
+from vllm.v1.worker.sentinel.eplb_redistribute import reset_eplb_async_state
+
+from .eplb_utils import (
+    ASYNC_JOB_TIMEOUT_S,
+    async_cycle_running,
+    finish_async_cycle,
+    make_async_eplb_state,
+    start_async_rearrangement,
 )
 
 
@@ -182,3 +195,118 @@ def test_commit_eplb_maps_for_layer_does_not_sync_host():
         _commit_eplb_maps_for_layer(model_state, new_phy2log, layer=0)
     finally:
         torch.cuda.set_sync_debug_mode(prev_mode)
+
+
+@pytest.fixture
+def async_eplb(dist_init, monkeypatch):
+    return make_async_eplb_state(
+        monkeypatch, torch.device(current_platform.device_type), num_models=2
+    )
+
+
+def test_async_executor_runs_jobs_on_a_daemon_thread():
+    """The worker thread must not block interpreter exit when a job hangs."""
+    if not torch.accelerator.is_available():
+        pytest.skip("Async EPLB needs an accelerator")
+    executor = AsyncEplbExecutor(torch.accelerator.current_device_index(), rank=0)
+    assert executor.thread.daemon
+
+    stream = executor.submit(lambda stream: stream).result(ASYNC_JOB_TIMEOUT_S)
+    assert isinstance(stream, torch.Stream)
+
+    error = RuntimeError("job failed")
+
+    def failing_job(stream):
+        raise error
+
+    assert executor.submit(failing_job).exception(ASYNC_JOB_TIMEOUT_S) is error
+
+
+def test_async_eplb_applies_every_layer_of_every_model_in_order(async_eplb):
+    run = async_eplb
+    start_async_rearrangement(run.state)
+    finish_async_cycle(run.state)
+
+    expected = [(m, layer) for m in range(2) for layer in range(2)]
+    assert run.transfers == expected
+    assert [meta[1] for meta in run.applied] == expected
+    for model_state in run.model_states:
+        expected_map = torch.arange(4).roll(1).repeat(2, 1)
+        assert torch.equal(model_state.physical_to_logical_map.cpu(), expected_map)
+
+
+def test_async_eplb_failure_raises_until_reset(async_eplb):
+    """A failed job reaches step() so fault tolerance can react. No new job is
+    scheduled until the reset, after which EPLB resumes."""
+    run = async_eplb
+    run.fail.add((0, 1))
+    start_async_rearrangement(run.state)
+    with pytest.raises(RuntimeError) as exc_info:
+        finish_async_cycle(run.state)
+    assert "injected transfer failure" in str(exc_info.value.__cause__)
+
+    with pytest.raises(RuntimeError) as again:
+        run.state.step()
+    assert again.value is exc_info.value
+    assert run.transfers == [(0, 0)]
+    # Elastic EP must not drain a cycle on a failed runner either.
+    with pytest.raises(RuntimeError) as on_drain:
+        run.state.drain_async()
+    assert on_drain.value is exc_info.value
+
+    reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
+    start_async_rearrangement(run.state)
+    finish_async_cycle(run.state)
+    assert run.transfers[-4:] == [(m, layer) for m in range(2) for layer in range(2)]
+
+
+def test_reset_waits_for_the_in_flight_job(async_eplb):
+    """Fault recovery must not rebuild the groups under a running job, so the
+    reset returns only after the job ended. Its result is never applied."""
+    run = async_eplb
+    gate = threading.Event()
+    run.gates[(0, 0)] = gate
+    start_async_rearrangement(run.state)  # Submits the gated transfer.
+
+    release = threading.Timer(0.2, gate.set)
+    release.start()
+    reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
+    assert gate.is_set()
+    assert run.transfers == [(0, 0)]
+    assert not async_cycle_running(run.state)
+
+    del run.gates[(0, 0)]
+    start_async_rearrangement(run.state)
+    finish_async_cycle(run.state)
+
+    dropped_transfer = 1
+    assert run.applied[0][2] != dropped_transfer
+    assert [meta[1] for meta in run.applied] == [
+        (m, layer) for m in range(2) for layer in range(2)
+    ]
+
+
+def test_reset_raises_when_the_in_flight_job_does_not_end(async_eplb):
+    run = async_eplb
+    run.state.parallel_config.cpu_distributed_timeout_seconds = 1
+    gate = threading.Event()
+    run.gates[(0, 0)] = gate
+    start_async_rearrangement(run.state)
+
+    try:
+        with pytest.raises(RuntimeError, match="still in a transfer"):
+            reset_eplb_async_state(SimpleNamespace(eplb_state=run.state))
+    finally:
+        gate.set()
+
+
+def test_drain_runs_the_remaining_transfers_and_applies_none(async_eplb):
+    """Elastic EP follows a drain with a full rearrange, so the drained layers
+    are transferred to keep the ranks in lockstep but not applied."""
+    run = async_eplb
+    start_async_rearrangement(run.state)
+
+    run.state.drain_async()
+    assert not async_cycle_running(run.state)
+    assert run.transfers == [(m, layer) for m in range(2) for layer in range(2)]
+    assert run.applied == []
