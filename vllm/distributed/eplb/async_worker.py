@@ -250,6 +250,8 @@ class AsyncEplbRunner:
         flags = torch.tensor(
             (int(error is not None), int(not done)), dtype=torch.int32, device="cpu"
         )
+        # One all-reduce per step for the whole cycle, not one per model: only
+        # the first model in _layers_left has a job.
         # cpu_all_reduce_ only sums, so count failed and busy ranks.
         get_ep_group().cpu_all_reduce_(flags)
         num_failed, num_busy = flags.tolist()
